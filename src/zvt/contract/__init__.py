@@ -147,7 +147,7 @@ class ActorType(Enum):
     #: 信托
     trust = "trust"
     #: 券商
-    broker = "broker"
+    broker = "qmt"
     #: 私募
     private_equity = "private_equity"
     #: 公司(可能包括私募)

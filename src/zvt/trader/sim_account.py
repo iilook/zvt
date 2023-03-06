@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-
 import logging
 import math
 from typing import List
+
+from marshmallow_sqlalchemy import SQLAlchemyAutoSchema
 
 from zvt.api import get_kdata, get_kdata_schema
 from zvt.api.trader_info_api import get_trader_info, clear_trader
 from zvt.contract import IntervalLevel, TradableEntity, AdjustType
 from zvt.contract.api import get_db_session, decode_entity_id
 from zvt.domain.trader_info import AccountStats, Position, Order, TraderInfo
-from zvt.trader import TradingSignalType, TradingListener, TradingSignal
+from zvt.trader import TradingSignal, AccountService, OrderType, trading_signal_type_to_order_type
 from zvt.trader.errors import (
     NotEnoughMoneyError,
     InvalidOrderError,
@@ -20,13 +21,6 @@ from zvt.trader.errors import (
 from zvt.utils.pd_utils import pd_is_not_null
 from zvt.utils.time_utils import to_pd_timestamp, to_time_str, TIME_FORMAT_ISO8601, is_same_date
 from zvt.utils.utils import fill_domain_from_dict
-
-ORDER_TYPE_LONG = "order_long"
-ORDER_TYPE_SHORT = "order_short"
-ORDER_TYPE_CLOSE_LONG = "order_close_long"
-ORDER_TYPE_CLOSE_SHORT = "order_close_short"
-
-from marshmallow_sqlalchemy import SQLAlchemyAutoSchema
 
 
 # FIXME:better way for schema<->domain,now just dump to schema and use dict['field'] for operation
@@ -44,105 +38,6 @@ class PositionSchema(SQLAlchemyAutoSchema):
 
 account_stats_schema = AccountDayStatsSchema()
 position_schema = PositionSchema()
-
-
-class AccountService(TradingListener):
-    logger = logging.getLogger(__name__)
-
-    def get_current_position(self, entity_id):
-        """
-        overwrite it to provide your real position
-
-        :param entity_id:
-        """
-        pass
-
-    def get_current_account(self):
-        pass
-
-    def order(
-        self,
-        entity_id,
-        current_price,
-        current_timestamp,
-        order_amount=0,
-        order_pct=1.0,
-        order_price=0,
-        order_type=ORDER_TYPE_LONG,
-        order_money=0,
-    ):
-        pass
-
-    # 开多,对于某些品种只能开多，比如中国股票
-    def buy(
-        self, entity_id, current_price, current_timestamp, order_amount=0, order_pct=1.0, order_price=0, order_money=0
-    ):
-        self.order(
-            entity_id,
-            current_price,
-            current_timestamp,
-            order_amount,
-            order_pct,
-            order_price,
-            order_type=ORDER_TYPE_LONG,
-            order_money=order_money,
-        )
-
-    # 开空
-    def sell(
-        self, entity_id, current_price, current_timestamp, order_amount=0, order_pct=1.0, order_price=0, order_money=0
-    ):
-        self.order(
-            entity_id,
-            current_price,
-            current_timestamp,
-            order_amount,
-            order_pct,
-            order_price,
-            order_type=ORDER_TYPE_SHORT,
-            order_money=order_money,
-        )
-
-    # 平多
-    def close_long(
-        self, entity_id, current_price, current_timestamp, order_amount=0, order_pct=1.0, order_price=0, order_money=0
-    ):
-        self.order(
-            entity_id,
-            current_price,
-            current_timestamp,
-            order_amount,
-            order_pct,
-            order_price,
-            order_type=ORDER_TYPE_CLOSE_LONG,
-            order_money=order_money,
-        )
-
-    # 平空
-    def close_short(
-        self, entity_id, current_price, current_timestamp, order_amount=0, order_pct=1.0, order_price=0, order_money=0
-    ):
-        self.order(
-            entity_id,
-            current_price,
-            current_timestamp,
-            order_amount,
-            order_pct,
-            order_price,
-            order_type=ORDER_TYPE_CLOSE_SHORT,
-            order_money=order_money,
-        )
-
-    @staticmethod
-    def trading_signal_to_order_type(trading_signal_type):
-        if trading_signal_type == TradingSignalType.open_long:
-            return ORDER_TYPE_LONG
-        if trading_signal_type == TradingSignalType.open_short:
-            return ORDER_TYPE_SHORT
-        if trading_signal_type == TradingSignalType.close_long:
-            return ORDER_TYPE_CLOSE_LONG
-        if trading_signal_type == TradingSignalType.close_short:
-            return ORDER_TYPE_CLOSE_SHORT
 
 
 class SimAccountService(AccountService):
@@ -163,6 +58,8 @@ class SimAccountService(AccountService):
         real_time=False,
         kdata_use_begin_time=False,
     ):
+        self.logger = logging.getLogger(self.__class__.__name__)
+
         self.entity_schema = entity_schema
         self.base_capital = base_capital
         self.buy_cost = buy_cost
@@ -287,15 +184,15 @@ class SimAccountService(AccountService):
     def on_trading_signals(self, trading_signals: List[TradingSignal]):
         for trading_signal in trading_signals:
             try:
-                self.on_trading_signal(trading_signal)
+                self.handle_trading_signal(trading_signal)
             except Exception as e:
                 self.logger.exception(e)
                 self.on_trading_error(timestamp=trading_signal.happen_timestamp, error=e)
 
-    def on_trading_signal(self, trading_signal: TradingSignal):
+    def handle_trading_signal(self, trading_signal: TradingSignal):
         entity_id = trading_signal.entity_id
         happen_timestamp = trading_signal.happen_timestamp
-        order_type = AccountService.trading_signal_to_order_type(trading_signal.trading_signal_type)
+        order_type = trading_signal_type_to_order_type(trading_signal.trading_signal_type)
         trading_level = trading_signal.trading_level.value
         if order_type:
             try:
@@ -321,10 +218,10 @@ class SimAccountService(AccountService):
                     self.order(
                         entity_id=entity_id,
                         current_price=the_price,
-                        current_timestamp=happen_timestamp,
+                        signal_timestamp=happen_timestamp,
                         order_pct=trading_signal.position_pct,
-                        order_money=trading_signal.order_money,
                         order_type=order_type,
+                        order_money=trading_signal.order_money,
                     )
                 else:
                     self.logger.warning(
@@ -440,7 +337,7 @@ class SimAccountService(AccountService):
         :param order_type:
         :type order_type:
         """
-        if order_type == ORDER_TYPE_LONG:
+        if order_type == OrderType.order_long:
             need_money = (order_amount * current_price) * (1 + self.slippage + self.buy_cost)
             if self.account.cash < need_money:
                 if self.rich_mode:
@@ -463,7 +360,7 @@ class SimAccountService(AccountService):
             if current_position.trading_t == 0:
                 current_position.available_long += order_amount
 
-        elif order_type == ORDER_TYPE_SHORT:
+        elif order_type == OrderType.order_short:
             need_money = (order_amount * current_price) * (1 + self.slippage + self.buy_cost)
             if self.account.cash < need_money:
                 if self.rich_mode:
@@ -483,14 +380,14 @@ class SimAccountService(AccountService):
             if current_position.trading_t == 0:
                 current_position.available_short += order_amount
 
-        elif order_type == ORDER_TYPE_CLOSE_LONG:
+        elif order_type == OrderType.order_close_long:
             self.account.cash += order_amount * current_price * (1 - self.slippage - self.sell_cost)
             # FIXME:如果没卖完，重新计算计算平均价
 
             current_position.available_long -= order_amount
             current_position.long_amount -= order_amount
 
-        elif order_type == ORDER_TYPE_CLOSE_SHORT:
+        elif order_type == OrderType.order_close_short:
             self.account.cash += 2 * (order_amount * current_position.average_short_price)
             self.account.cash -= order_amount * current_price * (1 + self.slippage + self.sell_cost)
 
@@ -508,7 +405,7 @@ class SimAccountService(AccountService):
             entity_id=current_position.entity_id,
             order_price=current_price,
             order_amount=order_amount,
-            order_type=order_type,
+            order_type=order_type.value,
             level=self.level.value,
             status="success",
         )
@@ -519,18 +416,18 @@ class SimAccountService(AccountService):
         self,
         entity_id,
         current_price,
-        current_timestamp,
+        signal_timestamp,
         order_amount=0,
         order_pct=1.0,
         order_price=0,
-        order_type=ORDER_TYPE_LONG,
+        order_type=OrderType.order_long,
         order_money=0,
     ):
         """
 
         :param entity_id:
         :param current_price:
-        :param current_timestamp:
+        :param signal_timestamp:
         :param order_amount:
         :param order_pct:
         :param order_price:
@@ -565,7 +462,7 @@ class SimAccountService(AccountService):
             # 按钱交易
             if order_money > 0:
                 # 开多
-                if order_type == ORDER_TYPE_LONG:
+                if order_type == OrderType.order_long:
                     if current_position.short_amount > 0:
                         raise InvalidOrderError("close the short position before open long")
 
@@ -585,9 +482,9 @@ class SimAccountService(AccountService):
                         )
                         return
 
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
                 # 开空
-                elif order_type == ORDER_TYPE_SHORT:
+                elif order_type == OrderType.order_short:
                     if current_position.long_amount > 0:
                         raise InvalidOrderError("close the long position before open short")
 
@@ -606,37 +503,37 @@ class SimAccountService(AccountService):
                             f"invalid order_money:{order_money}, cost:{cost}, order_amount:{order_amount}"
                         )
                         return
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
                 else:
                     raise InvalidOrderParamError("close long/short not support order_money")
 
             # 按数量交易
             elif order_amount > 0:
                 # 开多
-                if order_type == ORDER_TYPE_LONG:
+                if order_type == OrderType.order_long:
                     if current_position.short_amount > 0:
                         raise InvalidOrderError("close the short position before open long")
 
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
                 # 开空
-                elif order_type == ORDER_TYPE_SHORT:
+                elif order_type == OrderType.order_short:
                     if current_position.long_amount > 0:
                         raise InvalidOrderError("close the long position before open short")
 
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
                 # 平多
-                elif order_type == ORDER_TYPE_CLOSE_LONG:
+                elif order_type == OrderType.order_close_long:
                     if current_position.available_long >= order_amount:
                         self.update_position(
-                            current_position, order_amount, current_price, order_type, current_timestamp
+                            current_position, order_amount, current_price, order_type, signal_timestamp
                         )
                     else:
                         raise NotEnoughPositionError()
                 # 平空
-                elif order_type == ORDER_TYPE_CLOSE_SHORT:
+                elif order_type == OrderType.order_close_short:
                     if current_position.available_short >= order_amount:
                         self.update_position(
-                            current_position, order_amount, current_price, order_type, current_timestamp
+                            current_position, order_amount, current_price, order_type, signal_timestamp
                         )
                     else:
                         raise Exception("not enough position")
@@ -644,7 +541,7 @@ class SimAccountService(AccountService):
             # 按仓位比例交易
             elif 0 < order_pct <= 1:
                 # 开多
-                if order_type == ORDER_TYPE_LONG:
+                if order_type == OrderType.order_long:
                     if current_position.short_amount > 0:
                         raise InvalidOrderError("close the short position before open long")
 
@@ -659,9 +556,9 @@ class SimAccountService(AccountService):
                             order_amount = max((self.account.cash * order_pct) // cost, 1)
                         else:
                             raise NotEnoughMoneyError()
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
                 # 开空
-                elif order_type == ORDER_TYPE_SHORT:
+                elif order_type == OrderType.order_short:
                     if current_position.long_amount > 0:
                         raise InvalidOrderError("close the long position before open short")
 
@@ -677,10 +574,10 @@ class SimAccountService(AccountService):
                         else:
                             raise NotEnoughMoneyError()
 
-                    self.update_position(current_position, order_amount, current_price, order_type, current_timestamp)
+                    self.update_position(current_position, order_amount, current_price, order_type, signal_timestamp)
 
                 # 平多
-                elif order_type == ORDER_TYPE_CLOSE_LONG:
+                elif order_type == OrderType.order_close_long:
                     if current_position.available_long > 0:
                         if order_pct == 1.0:
                             order_amount = current_position.available_long
@@ -689,7 +586,7 @@ class SimAccountService(AccountService):
 
                         if order_amount != 0:
                             self.update_position(
-                                current_position, order_amount, current_price, order_type, current_timestamp
+                                current_position, order_amount, current_price, order_type, signal_timestamp
                             )
                         else:
                             self.logger.warning(
@@ -698,7 +595,7 @@ class SimAccountService(AccountService):
                     else:
                         raise NotEnoughPositionError()
                 # 平空
-                elif order_type == ORDER_TYPE_CLOSE_SHORT:
+                elif order_type == OrderType.order_close_short:
                     if current_position.available_short > 0:
                         if order_pct == 1.0:
                             order_amount = current_position.available_short
@@ -707,7 +604,7 @@ class SimAccountService(AccountService):
 
                         if order_amount != 0:
                             self.update_position(
-                                current_position, order_amount, current_price, order_type, current_timestamp
+                                current_position, order_amount, current_price, order_type, signal_timestamp
                             )
                         else:
                             self.logger.warning(
